@@ -1,8 +1,11 @@
 import jax
+jax.config.update('jax_enable_x64', True)
+
 import jax.numpy as jnp
 from jax.scipy.special import gammaln, gamma
 from scipy import special
 import time
+from jax.experimental.ode import odeint
 
 '''
 Implementation of the Gaussian Hypergeometric Function with JAX.  
@@ -37,7 +40,12 @@ def hyp2f1_taylor(a, b, c, z, max_terms=100, tol=1e-12):
         t = term(n)
         return n + 1, acc + t, t
 
-    init = (0, jnp.zeros_like(z, dtype=jnp.complex64), jnp.ones_like(z, dtype=jnp.complex64))
+    # Enforce complex128 dtype
+    init = (
+        0,
+        jnp.zeros_like(z, dtype=jnp.complex128),
+        jnp.ones_like(z, dtype=jnp.complex128)
+    )
     _, result, _ = jax.lax.while_loop(cond, body, init)
     return result
 
@@ -78,63 +86,90 @@ def hyp2f1_recursive(a, b, c, z, max_terms=100, max_depth=5, verbose=True):
 
 
 
-@jax.jit
 def hyp2f1_terminating(a, b, c, z):
-    n_max = jnp.minimum(-a, -b)
-    
+    # Truncate before invalid terms in the denominator
+    n_max = jnp.minimum(jnp.minimum(-a, -b), -c - 1)
+
     def term(n):
         num = pochhammer_safe(a, n) * pochhammer_safe(b, n)
         denom = pochhammer_safe(c, n) * jnp.exp(gammaln(n + 1))
-        return (num / denom) * z**n
 
-    # Define things for jax.lax.while_loop
+        # Avoid division by zero or inf
+        safe = jnp.logical_and(jnp.isfinite(denom), denom != 0.0)
+        t = jnp.where(safe, (num / denom) * z**n, 0.0)
+        return t.astype(jnp.complex128)
 
-    def sum_terms_whileLoop(term, n_max):
-
+    def sum_terms_kahan(term, n_max):
         def cond_fun(state):
-            n, acc = state 
+            n, acc, comp = state
             return n <= n_max
 
         def body_fun(state):
-            n, acc = state
-            acc = acc + term(n)
-            return (n+1, acc)
-        
-        # initialize state 
-        init_state = (0,0.0)
-        _, total = jax.lax.while_loop(cond_fun, body_fun, init_state)
+            n, acc, comp = state
+            t = term(n)
+            y = t - comp
+            temp = acc + y
+            comp = (temp - acc) - y
+            acc = temp
+            return (n + 1, acc, comp)
 
-        return total 
+        init_state = (
+            0,
+            jnp.array(0.0 + 0.0j, dtype=jnp.complex128),  # acc
+            jnp.array(0.0 + 0.0j, dtype=jnp.complex128),  # compensation
+        )
 
-    return sum_terms_whileLoop(term, n_max)
+        _, total, _ = jax.lax.while_loop(cond_fun, body_fun, init_state)
+        return total
+
+    return sum_terms_kahan(term, n_max)
+
 
 '''
 Wrapper function for the Hyp2F1 function
 '''
 
+@jax.jit
 def hyp2f1(a, b, c, z, max_terms=100):
-    mag_z = jnp.abs(z)
+    is_a0 = jnp.equal(a, 0)
+    is_b0 = jnp.equal(b, 0)
+    is_identity = jnp.logical_or(is_a0, is_b0)
+
     is_integer_a = jnp.equal(a, jnp.floor(a))
     is_integer_b = jnp.equal(b, jnp.floor(b))
-
     is_terminating = (
-        (is_integer_a and a <= 0) or
-        (is_integer_b and b <= 0)
+        (is_integer_a & (a <= 0)) |
+        (is_integer_b & (b <= 0))
     )
 
-    if is_terminating:
-        return hyp2f1_terminating(a, b, c, z)
-    elif mag_z < 1:
-        return hyp2f1_taylor(a, b, c, z, max_terms=max_terms)
-    else:
-        return hyp2f1_recursive(a, b, c, z, max_terms=max_terms)
+    def _identity(_):
+        return jnp.array(1.0 + 0.0j, dtype=jnp.complex128)
+
+    def _not_identity(_):
+        def _taylor():
+            return hyp2f1_taylor(a, b, c, z, max_terms=max_terms)
+        def _terminating():
+            return hyp2f1_terminating(a, b, c, z)
+        return jax.lax.cond(
+            is_terminating,
+            lambda _: _terminating(),
+            lambda _: _taylor(),
+            operand=None
+        )
+
+    return jax.lax.cond(
+        is_identity,
+        _identity,
+        _not_identity,
+        operand=None
+    )
 
 if __name__ == '__main__':
 
     print("Example case")
-    a = -2
-    b = -3
-    c = a + b + 2
+    a = -9
+    b = -8
+    c = -3
     z = 1.2 + 0.5j  # outside the unit disk
 
     _ = hyp2f1(a, b, c, z, max_terms = 100) # For JIT initialization
@@ -142,7 +177,7 @@ if __name__ == '__main__':
     start_time = time.time()
     value = hyp2f1(a, b, c, z, max_terms = 1000)
     print(value)
-    print(f"{time.time() - start_time}")
+    #print(f"{time.time() - start_time}")
 
     print("Compare with Scipy")
     start_time = time.time()
